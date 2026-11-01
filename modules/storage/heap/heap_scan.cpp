@@ -3,7 +3,6 @@
 #include <utility>
 
 #include "db/storage/directory_page.h"
-#include "db/storage/page.h"
 #include "db/storage/record_codec.h"
 #include "db/storage/slotted_page.h"
 
@@ -15,56 +14,62 @@
 //     ...
 //
 // The scan remembers where it is with four members:
-//   dirGuard_   pins the directory page it is reading now
+//   dirPageId_  the number of the directory page it is reading now
 //   nextEntry_  which entry of that directory page to visit next
 //   dataGuard_  pins the data page it is reading now (empty between pages)
 //   nextSlot_   which slot of that data page to look at next
 // Each call to next() continues from there and stops at the next live row.
 //
-// The guards are members of the scan, not local variables, so they do NOT
-// unpin when next() returns: the pages stay pinned between calls, which is
-// what lets the next call continue on the same page. When the scan is done
-// with a page, it must call release() itself.
+// Only one page is ever pinned. The directory page is pinned just long
+// enough to read one entry, then unpinned before the data page is pinned.
+// This keeps seqscan inside its budget of 1 frame (§M2.3) and is within
+// §M1.5's "at most one directory page and one data page".
+//
+// dataGuard_ is a member of the scan, not a local variable, so it does NOT
+// unpin when next() returns: the data page stays pinned between calls, which
+// is what lets the next call continue on the same page. When the scan is
+// done with the page, it must call release() itself.
 
 namespace db::storage
 {
     HeapScan::HeapScan(BufferPool& pool, FileId fileId, Schema schema)
         : pool_(&pool), fileId_(fileId), schema_(std::move(schema))
     {
-        // Nothing is pinned or read here. The first next() pins directory
+        // Nothing is pinned or read here. The first next() reads directory
         // page 0. So a scan that is made but never used costs no I/O.
     }
 
     // Move constructor: the new scan takes over everything `other` had (its
-    // two pins and its position), and `other` is marked Finished so that
-    // calling next() on it just returns false.
-    //   - The guards hand over their pins by themselves when moved (and the
-    //     moved-from guards become empty).
+    // pin and its position), and `other` is marked Finished so that calling
+    // next() on it just returns false.
+    //   - The guard hands over its pin by itself when moved (and the
+    //     moved-from guard becomes empty).
     //   - std::exchange(other.state_, State::Finished) does two things: it
     //     returns other's state (we copy it) and sets other's state to Finished.
-    //   - nextEntry_ and nextSlot_ are plain numbers, so they are just copied.
+    //   - dirPageId_, nextEntry_ and nextSlot_ are plain numbers, so they are
+    //     just copied.
     HeapScan::HeapScan(HeapScan&& other) noexcept
         : pool_(other.pool_), fileId_(other.fileId_), schema_(std::move(other.schema_)),
-          state_(std::exchange(other.state_, State::Finished)), dirGuard_(std::move(other.dirGuard_)),
+          state_(std::exchange(other.state_, State::Finished)), dirPageId_(other.dirPageId_),
           nextEntry_(other.nextEntry_), dataGuard_(std::move(other.dataGuard_)), nextSlot_(other.nextSlot_)
     {
     }
 
     // Move assignment (scanA = std::move(scanB)): scanA stops its own scan,
-    // then takes over scanB's pins and position; scanB is marked Finished.
+    // then takes over scanB's pin and position; scanB is marked Finished.
     HeapScan& HeapScan::operator=(HeapScan&& other) noexcept
     {
         if (this != &other) // scanA = std::move(scanA) must change nothing
         {
             // Assigning a guard first unpins the page that guard held, then
-            // takes over the other guard's pin. So these two lines give back
-            // this scan's own pages and take over other's.
+            // takes over the other guard's pin. So this line gives back this
+            // scan's own page and takes over other's.
             dataGuard_ = std::move(other.dataGuard_);
-            dirGuard_ = std::move(other.dirGuard_);
             pool_ = other.pool_;
             fileId_ = other.fileId_;
             schema_ = std::move(other.schema_);
             state_ = std::exchange(other.state_, State::Finished);
+            dirPageId_ = other.dirPageId_;
             nextEntry_ = other.nextEntry_;
             nextSlot_ = other.nextSlot_;
         }
@@ -100,9 +105,9 @@ namespace db::storage
     {
         if (state_ == State::NotStarted)
         {
-            // First call ever: pin directory page 0 (the first directory page
-            // of every table, §M1.5) and start at its entry 0.
-            dirGuard_ = PageGuard::fetch(*pool_, fileId_, 0);
+            // First call ever: start at directory page 0 (the first directory
+            // page of every table, §M1.5), entry 0. Nothing is pinned yet.
+            dirPageId_ = 0;
             nextEntry_ = 0;
             state_ = State::Running;
         }
@@ -133,20 +138,23 @@ namespace db::storage
                     return true;
                 }
                 // No live slot left on this page. Unpin it NOW, before step 2
-                // pins the next data page. If we only pinned the next page and
-                // let the assignment unpin this one, both data pages would be
-                // pinned for a moment (3 pins with the directory page), and
-                // the scan may hold at most 2 (§M1.5).
+                // pins the directory page: one page pinned at a time.
                 dataGuard_.release();
             }
 
-            // Step 2: go to the next data page listed on this directory page.
-            const DirectoryPage dir(dirGuard_.data());
+            // Step 2: pin the directory page just long enough to read what we
+            // need from it: the next entry's data page, or where the next
+            // directory page is. With LRU and B >= 2 this is a hit (the page
+            // was used a moment ago); it is a read only if it was evicted.
+            PageGuard dirGuard = PageGuard::fetch(*pool_, fileId_, dirPageId_);
+            const DirectoryPage dir(dirGuard.data());
             if (nextEntry_ < dir.entryCount())
             {
-                // Pin the data page that entry nextEntry_ points to, move
-                // nextEntry_ on by one, and start that page at slot 0.
-                dataGuard_ = PageGuard::fetch(*pool_, fileId_, dir.entry(nextEntry_).dataPageId);
+                // Read the data page number, then unpin the directory page
+                // BEFORE pinning the data page, so only one page is pinned.
+                const PageId dataPageId = dir.entry(nextEntry_).dataPageId;
+                dirGuard.release();
+                dataGuard_ = PageGuard::fetch(*pool_, fileId_, dataPageId);
                 ++nextEntry_;
                 nextSlot_ = 0;
                 continue; // back to step 1, to read the new page's slots
@@ -156,9 +164,7 @@ namespace db::storage
             // Read where the next directory page is BEFORE unpinning this
             // one (after release() we may not touch its bytes any more).
             const PageId nextDir = dir.nextDirPage();
-            // Unpin this directory page now, before pinning the next one, for
-            // the same reason as in step 1: at most one directory page pinned.
-            dirGuard_.release();
+            dirGuard.release();
             if (nextDir == kInvalidPageId)
             {
                 // That was the last directory page: the whole table has been
@@ -166,20 +172,19 @@ namespace db::storage
                 state_ = State::Finished;
                 return false;
             }
-            // Pin the next directory page and start at its entry 0, then go
-            // round the loop again (step 1 is skipped: no data page is held).
-            dirGuard_ = PageGuard::fetch(*pool_, fileId_, nextDir);
+            // Move on to the next directory page, entry 0, and go round the
+            // loop again (step 1 is skipped: no data page is held).
+            dirPageId_ = nextDir;
             nextEntry_ = 0;
         }
     }
 
     void HeapScan::close()
     {
-        // Unpin both pages now (release() on an empty guard does nothing, so
-        // calling close() twice is fine), and mark the scan Finished so that
-        // next() returns false from now on.
+        // Unpin the data page now (release() on an empty guard does nothing,
+        // so calling close() twice is fine), and mark the scan Finished so
+        // that next() returns false from now on.
         dataGuard_.release();
-        dirGuard_.release();
         state_ = State::Finished;
     }
 } // namespace db::storage

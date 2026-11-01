@@ -93,12 +93,13 @@ TEST_CASE("storage cli: create-table, load, scan --json gives the exact §M1.9 t
     const Run scan = run({"scan", "--db", dir.db(), "--table", "R", "--frames", "8", "--json"});
     REQUIRE(scan.code == 0);
     CHECK(scan.err.empty());
-    // One data page under D4: directory page 0 and data page 1 are the only
-    // fetches, both misses (the catalog pages read at open are not counted).
+    // One data page under D4: directory page 0 (fetched twice: for entry 0,
+    // then to find there is no next entry, a hit) and data page 1, so 2
+    // misses and 1 hit (the catalog pages read at open are not counted).
     CHECK(scan.out
           == "{\"table\":\"R\",\"schema\":[[\"a\",\"INT\"],[\"b\",\"VARCHAR\",20],[\"c\",\"INT\"]],"
              "\"rows\":[[42,\"bob\",7],[43,\"amy\",9]],"
-             "\"stats\":{\"hits\":0,\"misses\":2,\"evictions\":0,\"reads\":2,\"writes\":0}}\n");
+             "\"stats\":{\"hits\":1,\"misses\":2,\"evictions\":0,\"reads\":2,\"writes\":0}}\n");
 
     // The same through a JSON parser: exactly the five stats keys.
     const nlohmann::json json = nlohmann::json::parse(scan.out);
@@ -122,7 +123,7 @@ TEST_CASE("storage cli: load prints the row count; scan without --json is readab
              "42 | bob | 7\n"
              "43 | amy | 9\n"
              "2 rows\n"
-             "stats: hits=0 misses=2 evictions=0 reads=2 writes=0\n");
+             "stats: hits=1 misses=2 evictions=0 reads=2 writes=0\n");
 }
 
 TEST_CASE("storage cli: --limit stops right after row N; --limit 0 reads nothing")
@@ -141,7 +142,7 @@ TEST_CASE("storage cli: --limit stops right after row N; --limit 0 reads nothing
     CHECK(contains(zero.out, "\"rows\":[],\"stats\":{\"hits\":0,\"misses\":0,\"evictions\":0,\"reads\":0,\"writes\":0}"));
 }
 
-TEST_CASE("storage cli: a many-page scan at B = 2 has exact counters, identical on two runs and both policies")
+TEST_CASE("storage cli: a many-page scan at B = 2 has exact counters, identical on two runs; CLOCK gives the same rows")
 {
     TempDir dir("deterministic");
     std::string csv;
@@ -157,8 +158,10 @@ TEST_CASE("storage cli: a many-page scan at B = 2 has exact counters, identical 
 
     const nlohmann::json json = nlohmann::json::parse(first.out);
     CHECK(json.at("rows").size() == 2000);
-    // Directory page 0 stays pinned in one frame; the P data pages take turns
-    // in the other: 1 + P misses and reads, no hits. Evictions = P, not
+    // Under LRU, directory page 0 stays in one frame (it is used just before
+    // every data page, so it is always the newest) and the P data pages take
+    // turns in the other: 1 + P misses and reads. The directory page is
+    // fetched P + 1 times; all but the first are hits. Evictions = P, not
     // P - 1: open read catalog page 0 into a frame (before the snapshot), so
     // only one frame is free and data page 1 already evicts the catalog page.
     const std::uint64_t reads = json.at("stats").at("reads");
@@ -166,15 +169,22 @@ TEST_CASE("storage cli: a many-page scan at B = 2 has exact counters, identical 
     CHECK(dataPages > 10);
     CHECK(json.at("stats").at("misses") == reads);
     CHECK(json.at("stats").at("evictions") == dataPages);
-    CHECK(json.at("stats").at("hits") == 0);
+    CHECK(json.at("stats").at("hits") == dataPages);
     CHECK(json.at("stats").at("writes") == 0);
 
+    // CLOCK returns the same rows, and the same counters on every run. Its
+    // counters differ from LRU's: at B = 2 the hand can evict the directory
+    // page, which is then read again, so it never reads fewer pages.
     std::vector<std::string> clock = args;
     clock.push_back("--policy");
     clock.push_back("clock");
     const Run withClock = run(clock);
-    CHECK(withClock.code == 0);
-    CHECK(withClock.out == first.out);
+    const Run withClockAgain = run(clock);
+    REQUIRE(withClock.code == 0);
+    CHECK(withClock.out == withClockAgain.out);
+    const nlohmann::json clockJson = nlohmann::json::parse(withClock.out);
+    CHECK(clockJson.at("rows") == json.at("rows"));
+    CHECK(clockJson.at("stats").at("reads").get<std::uint64_t>() >= reads);
 }
 
 TEST_CASE("storage cli: usage errors exit 2 with a message on err")

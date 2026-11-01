@@ -1,6 +1,6 @@
 // Heap scan (SPEC §M1.5): rows in directory then slot order, at most one
-// directory page + one data page pinned, reads = pages of the table at any
-// B (no materialisation), delete-all gives an empty scan, lazy start,
+// page pinned at a time (exec seqscan budget = 1 frame), reads = pages of the table at any
+// B >= 2 under LRU (no materialisation), B = 1 works, delete-all gives an empty scan, lazy start,
 // close, moves, determinism.
 
 #include <cstddef>
@@ -168,7 +168,7 @@ namespace
         ColdScan result;
         result.rows = scanAll(heap).rids.size();
         result.cost = pool.stats() - before;
-        CHECK(pool.peakPinnedCount() <= 2);
+        CHECK(pool.peakPinnedCount() <= 1);
         CHECK(pool.pinnedFrameCount() == 0);
         return result;
     }
@@ -221,7 +221,7 @@ TEST_CASE("HeapScan: 500 rows come back in insert order; (1, 239) is followed by
     CHECK(pool.pinnedFrameCount() == 0);
 }
 
-TEST_CASE("HeapScan: a table twenty times larger than B completes with <= 2 pins; reads = table pages at any B")
+TEST_CASE("HeapScan: a table twenty times larger than B completes with 1 pin; reads = table pages at any B")
 {
     // 160 rows of 2000 bytes = 80 data pages + directory page 0 = 81 pages,
     // 20 times B = 4.
@@ -238,9 +238,25 @@ TEST_CASE("HeapScan: a table twenty times larger than B completes with <= 2 pins
         // only if something were read twice and cached, which never happens.
         CHECK(scan.cost.reads == 81);
         CHECK(scan.cost.misses == 81);
-        CHECK(scan.cost.hits == 0);
+        // The directory page is fetched 81 times (once per data page, plus
+        // once to find there is no next entry); only the first is a miss.
+        // Under LRU it is always the newest page, so it is never evicted.
+        CHECK(scan.cost.hits == 80);
         CHECK(scan.cost.writes == 0);
     }
+}
+
+TEST_CASE("HeapScan: works with B = 1 (one page pinned at a time); the directory page is then re-read")
+{
+    // Same 81-page table. With one frame, every fetch replaces the page
+    // before it: the directory page is read 81 times and each data page once.
+    Table table("scan_one_frame", wideSchema());
+    table.fill(160, wideRow);
+    const ColdScan scan = coldScan(table, 1);
+    CHECK(scan.rows == 160);
+    CHECK(scan.cost.reads == 80 + 81);
+    CHECK(scan.cost.hits == 0);
+    CHECK(scan.cost.writes == 0);
 }
 
 TEST_CASE("HeapScan: deleting every record gives an empty scan, without error")
@@ -282,7 +298,7 @@ TEST_CASE("HeapScan: a page whose rows were all deleted is skipped; the scan goe
     CHECK(scanned.tuples[238] == row(480));
 }
 
-TEST_CASE("HeapScan: crosses into directory page 682 and never pins more than 2 pages (B = 2)")
+TEST_CASE("HeapScan: crosses into directory page 682 and never pins more than 1 page (B = 2)")
 {
     // 1400 rows of 2000 bytes: data pages 1..681 on directory page 0,
     // 683..701 on directory page 682.
@@ -304,7 +320,7 @@ TEST_CASE("HeapScan: crosses into directory page 682 and never pins more than 2 
         REQUIRE(scanned.tuples[i] == wideRow(i));
     // 700 data pages + 2 directory pages, each read once.
     CHECK(cost.reads == 702);
-    CHECK(pool.peakPinnedCount() <= 2);
+    CHECK(pool.peakPinnedCount() <= 1);
     CHECK(pool.pinnedFrameCount() == 0);
 }
 
@@ -319,7 +335,7 @@ TEST_CASE("HeapScan: close in the middle drops every pin; next then returns fals
     Tuple tuple;
     for (int i = 0; i < 300; ++i)
         REQUIRE(scan.next(rid, tuple));
-    CHECK(pool.pinnedFrameCount() == 2); // directory page 0 + data page 2
+    CHECK(pool.pinnedFrameCount() == 1); // data page 2 only; the directory page is not kept pinned
     scan.close();
     CHECK(pool.pinnedFrameCount() == 0);
     CHECK_FALSE(scan.next(rid, tuple));
@@ -338,7 +354,7 @@ TEST_CASE("HeapScan: a scan that goes out of scope mid-way releases its pins")
         Rid rid;
         Tuple tuple;
         REQUIRE(scan.next(rid, tuple));
-        CHECK(pool.pinnedFrameCount() == 2);
+        CHECK(pool.pinnedFrameCount() == 1); // the data page only
     }
     CHECK(pool.pinnedFrameCount() == 0);
 }
@@ -358,7 +374,7 @@ TEST_CASE("HeapScan: a move hands over the position; the moved-from scan is fini
         for (int i = 0; i < 250; ++i)
             REQUIRE(first.next(rid, tuple));
         HeapScan second = std::move(first);
-        CHECK(pool.pinnedFrameCount() == 2); // the pins moved, none added
+        CHECK(pool.pinnedFrameCount() == 1); // the pin moved, none added
         CHECK_FALSE(first.next(rid, tuple)); // NOLINT(bugprone-use-after-move): testing it on purpose
         REQUIRE(second.next(rid, tuple));
         CHECK(rid == Rid{2, 10});
@@ -380,11 +396,12 @@ TEST_CASE("HeapScan: a move hands over the position; the moved-from scan is fini
         for (int i = 0; i < 300; ++i)
             REQUIRE(first.next(rid, tuple)); // first is on data page 2
         REQUIRE(second.next(rid, tuple));    // second is on data page 1
-        // Frames pinned: page 0 (by both), page 1 (second), page 2 (first).
-        CHECK(pool.pinnedFrameCount() == 3);
-        second = std::move(first);
-        // second gave back pages 0 and 1; page 1 is now unpinned.
+        // Frames pinned: page 1 (second) and page 2 (first). No scan keeps
+        // the directory page pinned.
         CHECK(pool.pinnedFrameCount() == 2);
+        second = std::move(first);
+        // second gave back page 1, which is now unpinned.
+        CHECK(pool.pinnedFrameCount() == 1);
         REQUIRE(second.next(rid, tuple));
         CHECK(rid == Rid{2, 60});
         CHECK(tuple == row(300));

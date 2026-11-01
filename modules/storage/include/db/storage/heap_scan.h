@@ -12,17 +12,25 @@
 ///         for each live slot: yield
 ///         unpin data page before moving on
 /// ```
-/// The rule is strict: at most one directory page and one data page are
-/// pinned at any instant (§M1.5, source conflict #7). The scan keeps only
-/// *where it is* (two guards and two counters), never a list of rows or
-/// pages: a scan that read the table into a list would hold more than B
-/// pages' worth of data and fail the module.
+/// Pins: **one page at a time**. §M1.5 allows at most one directory page and
+/// one data page; exec's seqscan has a budget of 1 frame (§M2.3), so the
+/// scan never holds both. Before each data page it pins the directory page,
+/// reads the next data page id, and unpins it again. The scan keeps only
+/// *where it is* (the directory page number, one guard and two counters),
+/// never a list of rows or pages: a scan that read the table into a list
+/// would hold more than B pages' worth of data and fail the module.
+///
+/// Cost of that choice: the directory page is fetched once per data page.
+/// Under LRU it is always the most recently used page, so with B >= 2 it
+/// stays resident and each fetch is a hit (every page is read once). Under
+/// CLOCK at a tiny B, or at B = 1, it can be evicted and read again.
 
 #include <cstdint>
 
 #include "db/common/schema.h"
 #include "db/storage/buffer_pool.h"
 #include "db/storage/file_registry.h"
+#include "db/storage/page.h"
 #include "db/storage/page_guard.h"
 #include "db/storage/rid.h"
 
@@ -71,7 +79,7 @@ namespace db::storage
         /// releases its pins, becomes finished, and the exception passes on.
         bool next(Rid& rid, Tuple& tuple);
 
-        /// Releases both pins now and finishes the scan; next() then
+        /// Releases the pin now and finishes the scan; next() then
         /// returns false. Calling it again does nothing.
         void close();
 
@@ -79,7 +87,7 @@ namespace db::storage
         enum class State
         {
             NotStarted, // no page pinned yet (lazy start)
-            Running,    // dirGuard_ holds the current directory page
+            Running,    // dirPageId_ names the current directory page
             Finished    // nothing pinned; next() returns false
         };
 
@@ -92,8 +100,9 @@ namespace db::storage
         Schema schema_;
         State state_ = State::NotStarted;
 
-        /// The current directory page and the next entry on it to visit.
-        PageGuard dirGuard_;
+        /// The current directory page (its number only; it is not kept
+        /// pinned) and the next entry on it to visit.
+        PageId dirPageId_ = 0;
         std::uint16_t nextEntry_ = 0;
         /// The current data page (empty between pages) and the next slot on it to look at.
         PageGuard dataGuard_;
