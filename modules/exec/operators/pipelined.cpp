@@ -11,6 +11,7 @@ namespace db::exec
         // The base class takes a list of children; most operators here have one.
         Operator::Children oneChild(std::unique_ptr<Operator> child)
         {
+            // Children is alias for std::vector<std::unique_ptr<Operator>>
             Operator::Children children;
             children.push_back(std::move(child));
             return children;
@@ -40,6 +41,8 @@ namespace db::exec
     {
         // A new scan starts at the first data page. It pins nothing until
         // the first next().
+        // If an old cursor was still there (open called again), assigning a new one destroys the old one first,
+        // so a reopen always starts from row 1.
         scan_ = heap_.scan();
     }
 
@@ -51,7 +54,8 @@ namespace db::exec
 
     void SeqScanOperator::doClose()
     {
-        // Destroys the scan, which releases its pinned page.
+        // reset() destroys the HeapScan inside the optional, which becomes empty.
+        //  HeapScan's destructor unpins whatever page it still holds
         scan_.reset();
     }
 
