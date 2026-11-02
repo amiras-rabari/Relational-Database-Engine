@@ -68,8 +68,9 @@ namespace db::storage
         // 1. An empty frame, lowest number first. Filling it throws out no
         //    page, so it is not an eviction. This is why the first B misses
         //    on an empty pool are not evictions.
+        //    A reserved frame holds no page but is not free either: skip it.
         for (std::size_t i = 0; i < frames_.size(); ++i)
-            if (!frames_[i].inUse)
+            if (!frames_[i].inUse && !frames_[i].reserved)
                 return {i, false};
 
         // 2. No empty frame: ask the replacer. It only picks frames with pin
@@ -213,6 +214,52 @@ namespace db::storage
             f.dirty = false;
             f.inUse = false;
             replacer_->forget(i);
+        }
+    }
+
+    void BufferPool::reserveFrames(std::size_t count)
+    {
+        // Check first, so a failed call changes nothing. Every frame without
+        // a pin is either empty or holds a page takeFrame may throw out.
+        const std::size_t framesWithoutPin = frames_.size() - pinnedFrames_;
+        if (count > framesWithoutPin)
+            throw std::logic_error("BufferPool::reserveFrames: " + std::to_string(count) + " frames asked, only "
+                + std::to_string(framesWithoutPin) + " of " + std::to_string(frames_.size()) + " have no pin");
+
+        for (std::size_t k = 0; k < count; ++k)
+        {
+            // An empty frame, or the replacer's victim (saved first if dirty,
+            // removed from the page table). The check above means it cannot
+            // fail. It names no page because none is being loaded.
+            const TakenFrame taken = takeFrame(0, kInvalidPageId);
+            frames_[taken.index].reserved = true;
+            // Pin count 1: the replacer never picks it, and pin() updates the
+            // in-use count and the peak.
+            pin(taken.index);
+            ++reservedFrames_;
+        }
+    }
+
+    void BufferPool::releaseFrames(std::size_t count)
+    {
+        if (count > reservedFrames_)
+            throw std::logic_error("BufferPool::releaseFrames: " + std::to_string(count) + " frames given back, only "
+                + std::to_string(reservedFrames_) + " reserved");
+
+        // Lowest frame first, so every run releases the same frames.
+        std::size_t released = 0;
+        for (std::size_t i = 0; i < frames_.size() && released < count; ++i)
+        {
+            if (!frames_[i].reserved)
+                continue;
+            frames_[i].reserved = false;
+            pinCounts_[i] = 0;
+            --pinnedFrames_;
+            --reservedFrames_;
+            // The frame is empty now: tell the replacer to forget whatever
+            // page it held before it was reserved.
+            replacer_->forget(i);
+            ++released;
         }
     }
 

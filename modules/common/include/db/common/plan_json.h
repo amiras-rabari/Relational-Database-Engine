@@ -16,7 +16,23 @@
 /// | `cross` | `left`, `right` |
 /// | `rename` | `to`, `child` |
 /// | `union`, `intersect`, `except` | `left`, `right` |
-/// | `distinct` | `child` |
+/// | `distinct` | `child` (physical: `mode`, `child`) |
+///
+/// Physical plans (exec SPEC §M2.2–§M2.3) add:
+///
+/// | op | fields |
+/// |---|---|
+/// | `seqscan` | `table` |
+/// | `filter` | `condition`, `child` |
+/// | `sort` | `keys` = `[["R.a","asc"], ["R.b","desc"]]`, `child` |
+/// | `group_by` | `mode`, `keys` = `["R.dept"]`, `aggregates` = `[["count","*"], ["avg","R.salary"]]`, `child` |
+/// | `nested_loop_join`, `sort_merge_join`, `hash_join` | `condition`, `left`, `right` |
+/// | `union_all` | `left`, `right` |
+/// | `limit` | `n` (0 or more), `child` |
+///
+/// `mode` is `"sort"` or `"hash"` and is required. Physical plans also accept
+/// `project`, `union`, `intersect`, `except` and, as our extension for
+/// self-joins, `rename` (DECISIONS.md 2026-11-01).
 ///
 /// `condition` is a string in plan style (toString with ConditionStyle::Plan,
 /// e.g. `"R.a > 500 and R.b = 'cs'"`); `columns` is an array of column
@@ -65,5 +81,19 @@ namespace db
     /// Parses JSON text and reads it with fromJson. Text that is not JSON is
     /// Error(Syntax) "Malformed plan JSON: ..." at its line and column.
     PlanNode fromJsonText(std::string_view text);
+
+    /// Reads a PHYSICAL plan (exec SPEC §M2.2), with the same checks and
+    /// messages as fromJson, but only physical ops are accepted: a logical op
+    /// such as `scan` or `join` is "Unknown plan operator 'scan'.". Also
+    /// Error(Schema), naming the node, for: a bad `mode`; sort `keys` empty
+    /// or an entry that is not [column, "asc"/"desc"]; an aggregate that is
+    /// not [function, column], an unknown function, or `*` with a function
+    /// other than count; limit `n` that is not a whole number 0..2^31-1.
+    /// Tables and columns are not looked up here; exec does that at open().
+    PlanNode physicalFromJson(const PlanJson& json);
+
+    /// Parses JSON text and reads it with physicalFromJson. Text that is not
+    /// JSON is Error(Syntax) at its line and column, as in fromJsonText.
+    PlanNode physicalFromJsonText(std::string_view text);
 
 } // namespace db

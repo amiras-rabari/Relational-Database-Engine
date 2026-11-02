@@ -118,15 +118,35 @@ namespace db::storage
         /// rid and to count its data pages. Unknown FileId -> std::logic_error.
         PageId numPages(FileId fileId) const;
 
+        /// Takes `count` frames out of the pool for memory that is not a page,
+        /// e.g. tuples that exec keeps in a C++ vector (exec D2: such memory
+        /// counts against B, §M2.1). While reserved, a frame holds no page,
+        /// and no page can be loaded into it. So pages in frames + reserved
+        /// frames is never more than B.
+        /// If a frame still holds an unpinned page, that page is thrown out
+        /// to make room (saved first if dirty: one WRITE). This is not a
+        /// miss, so it counts no eviction.
+        /// A reserved frame counts in pinnedFrameCount() and the peak, so the
+        /// peak is the most frames held at once, pages and reserved together.
+        /// Fewer than `count` frames free of pins -> std::logic_error, and
+        /// nothing changes.
+        void reserveFrames(std::size_t count);
+
+        /// Gives `count` reserved frames back to the pool; they become empty
+        /// frames. More than are reserved -> std::logic_error, nothing changes.
+        void releaseFrames(std::size_t count);
+
         /// A copy of the counters: a snapshot that later activity does not change.
         IoStats stats() const;
         /// The number of frames, B.
         std::size_t frameCount() const;
-        /// How many frames have a pin count above 0 right now.
+        /// How many frames are in use right now: pages with a pin count
+        /// above 0, plus reserved frames.
         std::size_t pinnedFrameCount() const;
         /// The highest pinnedFrameCount() seen since the pool was made or
         /// since the last resetPeak(). Chunk 09 uses it to check that a scan
-        /// never holds more than 2 pages.
+        /// never holds more than 2 pages; exec uses it to show the most
+        /// frames a plan held at once.
         std::size_t peakPinnedCount() const;
         /// Starts a new peak measurement from the current pinnedFrameCount().
         void resetPeak();
@@ -142,6 +162,9 @@ namespace db::storage
             bool dirty = false;
             /// false = the frame holds no page (never used, or discarded).
             bool inUse = false;
+            /// true = taken by reserveFrames: holds no page and must not
+            /// get one until releaseFrames gives it back.
+            bool reserved = false;
         };
 
         /// The frame takeFrame found for a new page, and whether another
@@ -181,8 +204,11 @@ namespace db::storage
         std::map<PageKey, std::size_t> pageTable_;
         std::unique_ptr<Replacer> replacer_;
         IoStats stats_;
-        /// Frames with pin count > 0 right now.
+        /// Frames with pin count > 0 right now (reserved frames included:
+        /// each has pin count 1, so the replacer never picks it).
         std::size_t pinnedFrames_ = 0;
+        /// Frames taken by reserveFrames right now.
+        std::size_t reservedFrames_ = 0;
         /// The highest pinnedFrames_ since construction or resetPeak().
         std::size_t peakPinned_ = 0;
     };

@@ -35,20 +35,50 @@ namespace db
             switch (op)
             {
                 case PlanOp::Scan:
+                case PlanOp::SeqScan:
                     return 0;
                 case PlanOp::Select:
                 case PlanOp::Project:
                 case PlanOp::Rename:
                 case PlanOp::Distinct:
+                case PlanOp::Filter:
+                case PlanOp::Sort:
+                case PlanOp::GroupBy:
+                case PlanOp::Limit:
                     return 1;
                 case PlanOp::Join:
                 case PlanOp::Cross:
                 case PlanOp::Union:
                 case PlanOp::Intersect:
                 case PlanOp::Except:
+                case PlanOp::NestedLoopJoin:
+                case PlanOp::SortMergeJoin:
+                case PlanOp::HashJoin:
+                case PlanOp::UnionAll:
                     return 2;
             }
             throw std::logic_error("childCount: unknown PlanOp value");
+        }
+
+        // The ops that exist only in physical plans. toString and
+        // outputSchema below read logical plans only.
+        bool isPhysicalOnly(PlanOp op)
+        {
+            switch (op)
+            {
+                case PlanOp::SeqScan:
+                case PlanOp::Filter:
+                case PlanOp::Sort:
+                case PlanOp::GroupBy:
+                case PlanOp::NestedLoopJoin:
+                case PlanOp::SortMergeJoin:
+                case PlanOp::HashJoin:
+                case PlanOp::UnionAll:
+                case PlanOp::Limit:
+                    return true;
+                default:
+                    return false;
+            }
         }
 
         bool hasCondition(PlanOp op)
@@ -60,6 +90,11 @@ namespace db
         // it is an internal bug, not a user error.
         void checkShape(const PlanNode& node)
         {
+            if (isPhysicalOnly(node.op))
+            {
+                throw std::logic_error("plan node '" + std::string(opName(node.op)) +
+                                       "' is physical; this function reads logical plans only");
+            }
             if (node.children.size() != childCount(node.op))
             {
                 throw std::logic_error("plan node '" + std::string(opName(node.op)) + "' has " +
@@ -111,6 +146,24 @@ namespace db
                 return "except";
             case PlanOp::Distinct:
                 return "distinct";
+            case PlanOp::SeqScan:
+                return "seqscan";
+            case PlanOp::Filter:
+                return "filter";
+            case PlanOp::Sort:
+                return "sort";
+            case PlanOp::GroupBy:
+                return "group_by";
+            case PlanOp::NestedLoopJoin:
+                return "nested_loop_join";
+            case PlanOp::SortMergeJoin:
+                return "sort_merge_join";
+            case PlanOp::HashJoin:
+                return "hash_join";
+            case PlanOp::UnionAll:
+                return "union_all";
+            case PlanOp::Limit:
+                return "limit";
         }
         throw std::logic_error("opName: unknown PlanOp value");
     }
@@ -185,19 +238,33 @@ namespace db
         switch (left.op)
         {
             case PlanOp::Scan:
+            case PlanOp::SeqScan:
                 return left.table == right.table;
             case PlanOp::Select:
             case PlanOp::Join:
+            case PlanOp::Filter:
+            case PlanOp::NestedLoopJoin:
+            case PlanOp::SortMergeJoin:
+            case PlanOp::HashJoin:
                 return left.condition == right.condition;
             case PlanOp::Project:
                 return left.columns == right.columns;
             case PlanOp::Rename:
                 return left.alias == right.alias;
+            case PlanOp::Distinct:
+                return left.mode == right.mode;
+            case PlanOp::Sort:
+                return left.sortKeys == right.sortKeys;
+            case PlanOp::GroupBy:
+                return left.mode == right.mode && left.columns == right.columns &&
+                       left.aggregates == right.aggregates;
+            case PlanOp::Limit:
+                return left.limitCount == right.limitCount;
             case PlanOp::Cross:
             case PlanOp::Union:
             case PlanOp::Intersect:
             case PlanOp::Except:
-            case PlanOp::Distinct:
+            case PlanOp::UnionAll:
                 return true;
         }
         throw std::logic_error("operator==: unknown PlanOp value");
@@ -227,6 +294,8 @@ namespace db
             case PlanOp::Except:
             case PlanOp::Distinct:
                 break;
+            default:
+                break; // physical-only ops: checkShape above already threw
         }
         out += "(" + toString(plan.children[0], style);
         if (plan.children.size() == 2)

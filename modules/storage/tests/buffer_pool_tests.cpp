@@ -464,3 +464,80 @@ TEST_CASE("pool: pinnedFrameCount, peakPinnedCount and resetPeak")
     pool.fetchPage(fx.file, 2);
     CHECK(pool.peakPinnedCount() == 1);
 }
+
+// ---------------------------------------------------------------- reserved frames (exec D2)
+
+TEST_CASE("pool: reserveFrames throws out unpinned pages, saving dirty ones, and counts no eviction")
+{
+    Fixture fx("pool_reserve_evicts");
+    BufferPool pool(3, ReplacementPolicy::Lru, fx.files);
+    pool.fetchPage(fx.file, 0);
+    pool.unpinPage(fx.file, 0, true); // dirty
+    pool.fetchPage(fx.file, 1);
+    pool.unpinPage(fx.file, 1, false);
+    pool.fetchPage(fx.file, 2);
+    pool.unpinPage(fx.file, 2, false);
+    const IoStats before = pool.stats();
+
+    // LRU throws out page 0 (saved: one write), then page 1.
+    pool.reserveFrames(2);
+    CHECK(pool.stats().writes == before.writes + 1);
+    CHECK(pool.stats().evictions == before.evictions);
+    CHECK(pool.stats().reads == before.reads);
+    CHECK_FALSE(pool.isResident(fx.file, 0));
+    CHECK_FALSE(pool.isResident(fx.file, 1));
+    CHECK(pool.isResident(fx.file, 2));
+    CHECK(pool.pinnedFrameCount() == 2);
+    CHECK(pool.peakPinnedCount() == 2);
+
+    // Only one frame is left for pages: page 3 replaces page 2, and a second
+    // pinned page has no frame.
+    pool.fetchPage(fx.file, 3);
+    CHECK_FALSE(pool.isResident(fx.file, 2));
+    CHECK(pool.peakPinnedCount() == 3);
+    CHECK_THROWS_AS(pool.fetchPage(fx.file, 4), std::logic_error);
+    pool.unpinPage(fx.file, 3, false);
+    pool.releaseFrames(2);
+}
+
+TEST_CASE("pool: reserveFrames beyond the frames free of pins throws and changes nothing")
+{
+    Fixture fx("pool_reserve_too_many");
+    BufferPool pool(3, ReplacementPolicy::Lru, fx.files);
+    pool.fetchPage(fx.file, 0); // stays pinned
+    pool.fetchPage(fx.file, 1);
+    pool.unpinPage(fx.file, 1, true);
+    const IoStats before = pool.stats();
+
+    CHECK_THROWS_AS(pool.reserveFrames(3), std::logic_error);
+    CHECK(pool.pinnedFrameCount() == 1);
+    CHECK(pool.stats() == before);
+    CHECK(pool.isResident(fx.file, 1));
+
+    pool.reserveFrames(2); // exactly the 2 frames without a pin
+    CHECK(pool.pinnedFrameCount() == 3);
+    pool.releaseFrames(2);
+    pool.unpinPage(fx.file, 0, false);
+}
+
+TEST_CASE("pool: releaseFrames makes the frames usable again; releasing too many throws")
+{
+    Fixture fx("pool_release");
+    BufferPool pool(3, ReplacementPolicy::Clock, fx.files);
+    pool.reserveFrames(3);
+    CHECK_THROWS_AS(pool.fetchPage(fx.file, 0), std::logic_error);
+    CHECK_THROWS_AS(pool.releaseFrames(4), std::logic_error);
+    CHECK(pool.pinnedFrameCount() == 3);
+
+    pool.releaseFrames(3);
+    CHECK(pool.pinnedFrameCount() == 0);
+    CHECK(pool.peakPinnedCount() == 3);
+    // All three frames hold pages again; released frames are empty, so
+    // filling them is not an eviction.
+    for (PageId p = 0; p < 3; ++p)
+        pool.fetchPage(fx.file, p);
+    CHECK(pool.stats().evictions == 0);
+    CHECK(pool.pinnedFrameCount() == 3);
+    for (PageId p = 0; p < 3; ++p)
+        pool.unpinPage(fx.file, p, false);
+}
